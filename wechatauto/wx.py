@@ -272,6 +272,7 @@ def _db_row_to_message(row: dict, chat: 'Chat', self_wxid: str = None,
     msg.local_id = row.get('local_id')
     msg.sort_seq = row.get('sort_seq')
     msg.create_time = row.get('create_time')
+    msg.shard = row.get('shard')
     msg.attr = 'self' if is_self else 'friend'
 
     msg.sender_wxid = sender_wxid

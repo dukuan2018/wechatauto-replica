@@ -2780,13 +2780,20 @@ class WeChatGUI:
         if not self.ensure_visible():
             return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
         if who:
-            self.open_chat(who)
+            if not self.open_chat(who):
+                return WxResponse.failure(f'无法打开目标会话：{who}')
             time.sleep(0.8)
-        if not self.focus_input():
-            return WxResponse.failure('输入框不可用')
-        self._input.type_unicode('@')
-        time.sleep(0.9)
         box = self.get_input_box()
+        if not box or not self.focus_input(box):
+            return WxResponse.failure('输入框不可用')
+        had_text = self._input_box_has_text(box)
+        if self.set_clipboard('@') is False:
+            return WxResponse.failure('无法将 @ 写入剪贴板')
+        self._input.key(VK_V, ctrl=True)
+        time.sleep(0.3)
+        if not had_text and not self._input_box_has_text(box):
+            return WxResponse.failure('未确认 @ 已输入；请确认微信输入框已获得焦点且桌面已解锁')
+        time.sleep(0.9)
         popup = (self.right_pane_left, max(80, (box[1] if box else int(self.render_h * 0.49)) - 500),
                  self.render_w, (box[1] if box else int(self.render_h * 0.77)))
         items = self.ocr(popup)
