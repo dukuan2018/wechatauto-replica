@@ -140,6 +140,25 @@ def _gate_cache_put(identity: str, **fields) -> None:
         wxlog.debug(f'gate 缓存写盘失败（不影响功能）：{e}')
 
 
+def _gate_cache_remove(identity: str, *fields: str) -> None:
+    """移除当前不再可信的缓存字段，避免失败候选被永久优先使用。"""
+    entry = _gate_cache().get(identity)
+    if not entry:
+        return
+    for field in fields:
+        entry.pop(field, None)
+    if not entry:
+        _gate_cache().pop(identity, None)
+    try:
+        os.makedirs(os.path.dirname(GATE_CACHE_FILE), exist_ok=True)
+        tmp = GATE_CACHE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(_gate_cache(), f, ensure_ascii=False, sort_keys=True)
+        os.replace(tmp, GATE_CACHE_FILE)
+    except OSError as e:
+        wxlog.debug(f'gate 缓存清理失败（不影响功能）：{e}')
+
+
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
 IMAGE_SCN_MEM_WRITE = 0x80000000
 PROCESS_VM_OPERATION = 0x0008
@@ -498,7 +517,26 @@ class AccessibilityGate:
         written = ctypes.c_size_t(0)
         ok = ctypes.windll.kernel32.WriteProcessMemory(
             handle, ctypes.c_void_p(address), buf, 1, ctypes.byref(written))
-        return bool(ok and written.value == 1)
+        if not (ok and written.value == 1):
+            return False
+        return AccessibilityGate._read_process_byte(handle, address) == (value & 0xFF)
+
+    @staticmethod
+    def _hwnd_tree_snapshot(hwnd: int) -> str:
+        """返回窗口根节点和直接子节点类型，用于区分句柄错误与 provider 未物化。"""
+        try:
+            root = auto.ControlFromHandle(hwnd)
+            if root is None:
+                return 'root=<none>'
+            try:
+                children = root.GetChildren()
+            except Exception:
+                children = []
+            classes = [str(getattr(child, 'ClassName', '') or '?') for child in children[:8]]
+            return 'root=%s children=%s' % (
+                getattr(root, 'ClassName', '') or '?', ','.join(classes) or '<none>')
+        except Exception as exc:
+            return 'snapshot-error=%s' % type(exc).__name__
 
     @staticmethod
     def _mmui_present(hwnd: int, timeout: float = 1.0) -> bool:
@@ -540,6 +578,16 @@ class AccessibilityGate:
             wxlog.warning("热激活 UIA 失败：PID %s 未找到 Weixin.dll。", pid)
             return False
         base, _size, dll_path = mod
+        identity = _dll_identity(dll_path)
+        try:
+            root = auto.ControlFromHandle(hwnd)
+            window_class = getattr(root, 'ClassName', '') or '<unknown>'
+            window_title = (getattr(root, 'Name', '') or '<empty>')[:80]
+        except Exception:
+            window_class, window_title = '<unavailable>', '<unavailable>'
+        wxlog.info(
+            'UIA 激活目标：PID=%s HWND=0x%x class=%s title=%r DLL=%s base=0x%x',
+            pid, hwnd, window_class, window_title, dll_path, int(base))
         candidates = cls._qaccessible_candidate_rvas(dll_path)[:max_candidates]
         if not candidates:
             wxlog.warning("热激活 UIA 失败：不支持的 Weixin.dll 版本路径 %s。", dll_path)
@@ -556,16 +604,29 @@ class AccessibilityGate:
         if not handle:
             wxlog.warning("热激活 UIA 失败：无法打开 Weixin.exe PID %s。", pid)
             return False
+        failed_verified = False
         try:
             for rva in candidates:
                 address = int(base) + int(rva)
                 current = cls._read_process_byte(handle, address)
                 if current is None:
+                    wxlog.warning('UIA gate 候选不可读：PID=%s RVA=0x%x address=0x%x',
+                                  pid, rva, address)
+                    failed_verified = failed_verified or (
+                        _VERIFIED_GATE_RVA.get(identity) == int(rva))
                     continue
                 wrote = False
                 original = current
                 if current != 1:
                     if not cls._write_process_byte(handle, address, 1):
+                        cls._write_process_byte(handle, address, current)
+                        observed = cls._read_process_byte(handle, address)
+                        wxlog.warning('UIA gate 写入/读回校验失败：PID=%s RVA=0x%x 原值=%s',
+                                      pid, rva, current)
+                        wxlog.debug('UIA gate 失败后的读回值：PID=%s RVA=0x%x byte=%s',
+                                    pid, rva, observed)
+                        failed_verified = failed_verified or (
+                            _VERIFIED_GATE_RVA.get(identity) == int(rva))
                         continue
                     wrote = True
                     wxlog.info("热激活 UIA：PID=%s Weixin.dll+0x%x: %s -> 1",
@@ -573,14 +634,22 @@ class AccessibilityGate:
                 if not verify:
                     return True
                 if cls._mmui_present(hwnd):
-                    identity = _dll_identity(dll_path)
                     _VERIFIED_GATE_RVA[identity] = int(rva)
                     _gate_cache_put(identity, verified=int(rva))
                     wxlog.info("UIA 树已物化，已记录 gate RVA：Weixin.dll+0x%x", rva)
                     return True
+                snapshot = cls._hwnd_tree_snapshot(hwnd)
+                wxlog.warning('UIA gate 已写入但目标窗口仍无 mmui 树：PID=%s RVA=0x%x byte=%s; %s',
+                              pid, rva, cls._read_process_byte(handle, address), snapshot)
+                failed_verified = failed_verified or (
+                    _VERIFIED_GATE_RVA.get(identity) == int(rva))
                 # 候选不对：恢复原值，继续试下一个
                 if wrote:
                     cls._write_process_byte(handle, address, original)
+            if failed_verified:
+                _VERIFIED_GATE_RVA.pop(identity, None)
+                _gate_cache_remove(identity, 'verified')
+                wxlog.warning('已清除本次失效的 UIA gate 验证缓存：%s', identity)
             wxlog.warning("热激活 UIA 失败：%d 个候选均未使 mmui 树物化（%s）。",
                           len(candidates), os.path.basename(dll_path))
             return False

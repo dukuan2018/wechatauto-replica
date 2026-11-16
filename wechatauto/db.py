@@ -2300,7 +2300,7 @@ class WeChatDB:
             conn = self._open(rel)
             try:
                 rows = conn.execute(
-                    "SELECT username, nick_name, remark FROM contact "
+                    "SELECT username, nick_name, remark, alias FROM contact "
                     "WHERE nick_name LIKE ? OR remark LIKE ? OR username LIKE ? "
                     "OR alias LIKE ? LIMIT 50",
                     ("%" + keyword + "%",) * 4,
@@ -2312,9 +2312,46 @@ class WeChatDB:
                     "username": r["username"],
                     "nick_name": r["nick_name"],
                     "remark": r["remark"],
+                    "alias": r["alias"],
                 })
             break
         return results
+
+    def get_contact_search_name(self, user: str) -> str:
+        """返回能在微信界面唯一定位联系人的搜索词。
+
+        优先使用备注、微信号（alias），最后才使用昵称；如果候选词会命中
+        多个联系人，返回空字符串，调用方应跳过自动发送以避免误发。
+        """
+        user = (user or '').strip()
+        if not user:
+            return ''
+        conn = self._contact_conn()
+        if not conn:
+            return ''
+        try:
+            row = conn.execute(
+                "SELECT username, nick_name, remark, alias FROM contact "
+                "WHERE username=? LIMIT 1", (user,),
+            ).fetchone()
+            if not row:
+                return ''
+            candidates = [row['remark'], row['alias'], row['nick_name']]
+            for candidate in candidates:
+                candidate = (candidate or '').strip()
+                if not candidate:
+                    continue
+                matches = conn.execute(
+                    "SELECT DISTINCT username FROM contact "
+                    "WHERE remark=? OR alias=? OR nick_name=?",
+                    (candidate, candidate, candidate),
+                ).fetchall()
+                usernames = {r['username'] for r in matches if r['username']}
+                if usernames == {user}:
+                    return candidate
+        finally:
+            conn.close()
+        return ''
 
     def get_nickname(self, user: str) -> str:
         """通过微信号查昵称（用于显示）"""

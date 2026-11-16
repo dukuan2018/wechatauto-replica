@@ -2766,6 +2766,64 @@ class WeChatGUI:
                     if ok else WxResponse.failure('引用已操作发送，但数据库未确认', data={'content': text}))
         return WxResponse.success(f'引用已发送：{text}', data={'content': text})
 
+    def accept_transfer(self, who: Optional[str] = None,
+                        transfer_id: Optional[str] = None,
+                        timeout: float = 10.0) -> WxResponse:
+        """打开当前会话中的转账卡片并点击「收款」。
+
+        转账卡片和收款按钮属于微信自绘界面，数据库只能识别状态，不能直接
+        完成收款。因此调用方应先确认消息是发给当前账号的待收款转账，再调用
+        此方法执行桌面点击。
+        """
+        if not self.ensure_visible():
+            return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
+        if who and not self.open_chat(who):
+            return WxResponse.failure(f'无法打开会话：{who}')
+
+        def compact(value: str) -> str:
+            return re.sub(r'\s+', '', value or '')
+
+        box = self.get_input_box()
+        bottom = box[1] if box else self.render_h - 80
+        deadline = time.monotonic() + max(1.0, float(timeout))
+        card = None
+        while time.monotonic() < deadline:
+            items = self.ocr_zoomed(
+                (self.right_pane_left, 70, self.render_w, bottom), scale=2)
+            for text, x, y, w, h in items:
+                value = compact(text)
+                if '微信转账' in value or '收到转账' in value:
+                    card = (x, y, w, h)
+                    break
+            if card:
+                break
+            time.sleep(0.35)
+        if not card:
+            return WxResponse.failure('未在当前会话中定位到转账卡片')
+
+        x, y, w, h = card
+        self.wx_click(self.origin_x + int(x + w / 2),
+                      self.origin_y + int(y + h / 2))
+        time.sleep(0.7)
+
+        box = self.get_input_box()
+        bottom = box[1] if box else self.render_h - 80
+        for labels in (('确认收款',), ('立即收款',), ('收款',), ('接受',)):
+            items = self.ocr_zoomed(
+                (self.right_pane_left, 70, self.render_w, bottom), scale=2)
+            for text, x, y, w, h in items:
+                value = compact(text)
+                if any(value == label or label in value for label in labels):
+                    self.wx_click(self.origin_x + int(x + w / 2),
+                                  self.origin_y + int(y + h / 2))
+                    return WxResponse.success(
+                        '已点击收款按钮，等待微信完成入账',
+                        data={'transfer_id': transfer_id or ''})
+            time.sleep(0.35)
+        return WxResponse.failure(
+            '已打开转账卡片，但未找到收款按钮',
+            data={'transfer_id': transfer_id or ''})
+
     # ------------------------------------------------------------------
     # 艾特成员（群聊）
     # ------------------------------------------------------------------
@@ -2775,6 +2833,16 @@ class WeChatGUI:
 
         流程：输入框键入 '@' → OCR 成员选择弹层定位成员 → 点击 → 输入正文 → 发送。
         """
+        def clear_input() -> None:
+            """艾特失败时清掉残留的 @，避免污染用户输入框。"""
+            try:
+                current = self.get_input_box()
+                if current and self.focus_input(current):
+                    self._input.key(VK_A, ctrl=True)
+                    self._input.key(VK_DELETE)
+            except Exception:
+                pass
+
         # @ 消息落库正文带有「@昵称」包装，只能包含匹配；水位见 _send_watermark。
         mark = self._send_watermark(who) if verify else None
         if not self.ensure_visible():
@@ -2792,6 +2860,7 @@ class WeChatGUI:
         self._input.key(VK_V, ctrl=True)
         time.sleep(0.3)
         if not had_text and not self._input_box_has_text(box):
+            clear_input()
             return WxResponse.failure('未确认 @ 已输入；请确认微信输入框已获得焦点且桌面已解锁')
         time.sleep(0.9)
         popup = (self.right_pane_left, max(80, (box[1] if box else int(self.render_h * 0.49)) - 500),
@@ -2803,12 +2872,15 @@ class WeChatGUI:
                 target = rhythm.point((x, yy, x + w, yy + h))
                 break
         if not target:
+            clear_input()
             return WxResponse.failure(f'未在成员列表中找到：{member}')
         self.wx_click(self.origin_x + target[0], self.origin_y + target[1])
         time.sleep(0.6)
         if text and not self.input_text(text):
+            clear_input()
             return WxResponse.failure('输入消息正文失败')
-        self.click_send()
+        if not self.click_send():
+            return WxResponse.failure('@消息发送失败')
         if verify:
             ok = self._verify_sent(text, who, mode='contains', after=mark)
             return (WxResponse.success(f'@成员消息已发送并确认', data={'member': member, 'content': text})

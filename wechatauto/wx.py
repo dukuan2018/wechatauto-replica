@@ -133,10 +133,12 @@ class _AllMessageChat:
     成真正的 :class:`Chat` 并缓存下来，``SendMsg`` 原样转发过去。
     """
 
-    def __init__(self, username: str, nickname: str = '', factory=None, db=None):
+    def __init__(self, username: str, nickname: str = '', factory=None, db=None,
+                 gui_target: str = ''):
         self.who = username
         self._wxid = username
         self._nickname = nickname or ''
+        self._gui_target = gui_target or ''
         self._factory = factory
         self._chat = None
         self._db = db          # 只读库用（查群成员），不需要 GUI
@@ -168,12 +170,15 @@ class _AllMessageChat:
     def chat(self):
         if self._chat is None and self._factory is not None:
             try:
-                self._chat = self._factory(self.who)
+                self._chat = self._factory(self._gui_target or self.who)
             except Exception as e:
                 wxlog.debug(f'全局监听会话升级为 Chat 失败：{e}')
         return self._chat
 
     def SendMsg(self, msg: str, **kw):
+        if not self._gui_target and self.who not in ('filehelper', '文件传输助手'):
+            return WxResponse.failure(
+                '无法唯一定位会话，已跳过发送（可能存在重名联系人）')
         chat = self.chat
         if chat is None:
             from wechatauto.exceptions import WechatautoError
@@ -310,7 +315,7 @@ def _resolve_wxid(db, name: str) -> str:
         return 'filehelper'
     try:
         for hit in db.search_contact(name):
-            if name in (hit.get('nick_name'), hit.get('remark')):
+            if name in (hit.get('nick_name'), hit.get('remark'), hit.get('alias')):
                 return hit['username']
     except Exception:
         pass
@@ -523,6 +528,54 @@ class Chat:
             return WxResponse.failure(bad.get('reason', '添加失败'), data=data)
         if dry_run:
             return WxResponse.success('勘察完成（未点添加到通讯录）', data=data)
+        return WxResponse.success(f'已发送 {len(added)} 条好友申请', data=data)
+
+    # -- 手机号加好友（UIA） ---------------------------------------------
+
+    def _phone_friend_ops(self):
+        """构造 PhoneAddFriendOps；UIA 不可用返回 None。"""
+        from wechatauto.phone_friend import PhoneAddFriendOps
+        uia = self._gui._get_uia()
+        if uia is None:
+            uia = self._gui._get_uia(refresh=True)
+        if uia is None:
+            return None
+        return PhoneAddFriendOps(uia=uia, db=self._db)
+
+    @uilock
+    def AddFriendsByPhone(
+            self,
+            phones: List[str],
+            message: str = None,
+            dry_run: bool = True,
+            interval: float = 3.0,
+            label: str = '直充2',
+        ) -> WxResponse:
+        """按手机号批量查找用户并发送好友申请。
+
+        ``dry_run=True`` 是默认值，只打开资料卡并判断能否添加；明确传
+        ``dry_run=False`` 才会提交好友申请。单个号码失败不影响后续号码。
+        """
+        from wechatauto.phone_friend import collect_phones
+        source = [phones] if isinstance(phones, str) else (phones or [])
+        targets = collect_phones(source)
+        if not targets:
+            return WxResponse.failure('没有有效的中国大陆手机号')
+        ops = self._phone_friend_ops()
+        if ops is None:
+            return WxResponse.failure('UIA 驱动不可用，无法按手机号添加好友')
+        results = ops.add_many(targets, message=message, dry_run=dry_run,
+                               interval=interval, label=label)
+        added = [r.get('phone') for r in results if r.get('added')]
+        failed = [r for r in results if not r.get('ok')]
+        data = {'results': results, 'added': added,
+                'dry_run': bool(dry_run)}
+        if failed:
+            return WxResponse.failure(
+                f'处理完成：成功 {len(results) - len(failed)}，失败 {len(failed)}',
+                data=data)
+        if dry_run:
+            return WxResponse.success('勘察完成（未发送好友申请）', data=data)
         return WxResponse.success(f'已发送 {len(added)} 条好友申请', data=data)
 
     # -- 信息 -------------------------------------------------------------
@@ -1562,9 +1615,14 @@ class WeChat(Chat, Listener):
                         nick = self._db.get_nickname(username) or ''
                     except Exception:
                         nick = ''
+                    try:
+                        gui_target = self._db.get_contact_search_name(username)
+                    except Exception:
+                        gui_target = ''
                     chat = _AllMessageChat(
                         username, nick,
                         factory=lambda who: Chat(who, self._gui, self._db),
+                        gui_target=gui_target,
                         db=self._db)
                     self._all_chat_cache[username] = chat
                 msg = _db_row_to_message(row, chat, self_wxid, self._db)

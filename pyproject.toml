@@ -37,6 +37,7 @@ dependencies = [
     "zstandard>=0.19.0",
     "pyautogui>=0.9.53",
     "opencv-python>=4.8.0",
+    "qrcode[pil]>=7.4",
 ]
 
 [project.scripts]

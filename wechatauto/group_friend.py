@@ -50,6 +50,8 @@ INFO_BTN_NAME = "聊天信息"
 SEARCH_BOX_NAME = "搜索"
 RESULT_ROW_CLS = "mmui::XTableCell"
 PROFILE_POP_CLS = "mmui::ProfileUniquePop"
+LABEL_POPOVER_CLS = "mmui::LabelPopover"
+LABEL_CELL_CLS = "mmui::LabelCellView"
 ADD_BTN_NAME = "添加到通讯录"
 ADD_BTN_AID = "add_friend_button"
 FRIEND_BTN_NAME = "发消息"
@@ -60,10 +62,47 @@ SEND_BTN_NAME = "发送"
 # **没有「发送」**；旧版本是「发送」。两处都认，防止改版又断。
 SEND_BTN_NAMES = (SEND_BTN_NAME, "确定")
 REQUEST_HINT = "发送添加朋友申请"
+REMARK_EDIT_NAME = "修改备注"
+LABEL_EDIT_NAME = "修改标签"
+RISK_CONTROL_PHRASES = (
+    "操作频繁",
+    "频繁操作",
+    "添加好友过于频繁",
+    "请稍后再试",
+    "已达上限",
+    "达到上限",
+    "账号存在异常",
+)
+
+
+def append_remark(existing: str, suffix: str) -> str:
+    """保留原备注并追加内容；已包含时不重复追加。"""
+    existing = (existing or "").strip()
+    suffix = (suffix or "").strip()
+    if not suffix or suffix in existing:
+        return existing
+    return (existing + " " + suffix).strip()
+
+
+def find_risk_control_text(names: Sequence[str]) -> Optional[str]:
+    """从界面文字中识别微信明确的频控或账号限制提示。"""
+    for name in names:
+        text = (name or "").strip()
+        for phrase in RISK_CONTROL_PHRASES:
+            if phrase in text:
+                return text
+    return None
 
 
 class GroupAddFriendOps(LabelOps):
     """群成员加好友。脚手架（抬窗/落点归属校验/搜索粘贴）全部复用 :class:`LabelOps`。"""
+
+    # 资料页中的视频号内容会异步加载并把底部按钮向下推。先完整观察一段时间，
+    # 再要求按钮连续稳定，避免在首屏短暂稳定时点到旧坐标。
+    add_button_settle_delay = 2.5
+    add_button_poll_interval = 0.2
+    add_button_stable_samples = 4
+    add_button_wait_timeout = 6.0
 
     # ------------------------------------------------------------------ 找窗
     def main_window(self):
@@ -347,37 +386,250 @@ class GroupAddFriendOps(LabelOps):
             pass
         return self._find(ctrl, (REQUEST_HINT,), cls="Edit", contains=False) is not None
 
-    def send_request(self, message: Optional[str] = None) -> Dict:
-        """找申请框 → （可选）填留言 → 点提交（「确定」，老版本「发送」）。"""
-        card_hwnd, card = self._top_by_class(PROFILE_POP_CLS) or (0, None)
+    def _fresh_add_button(self, card):
+        """从当前控件树重新取一次「添加到通讯录」按钮。"""
+        fresh = self._find_by_aid(card, ADD_BTN_AID)
+        if fresh is None:
+            fresh = self._find(card, (ADD_BTN_NAME,),
+                               cls="mmui::ProfileBottomButton", contains=False)
+        if fresh is None:
+            fresh = self._find(card, (ADD_BTN_NAME,),
+                               cls="mmui::XOutlineButton", contains=False)
+        return fresh
+
+    @staticmethod
+    def _control_rect(ctrl) -> Optional[Tuple[int, int, int, int]]:
+        """读取有效的控件矩形；控件失效或滚出可视区时返回 ``None``。"""
+        try:
+            rect = ctrl.BoundingRectangle
+            values = (int(rect.left), int(rect.top),
+                      int(rect.right), int(rect.bottom))
+        except Exception:
+            return None
+        if values[2] <= values[0] or values[3] <= values[1]:
+            return None
+        return values
+
+    @staticmethod
+    def _monotonic() -> float:
+        return time.monotonic()
+
+    def _wait_for_layout(self, seconds: float) -> None:
+        time.sleep(max(0.0, seconds))
+
+    def _activate_add_button(self, card_hwnd: int, card, _add) -> Dict:
+        """等待视频号首轮加载且按钮停止移动后，再点击最新位置。
+
+        手机号资料页先画基本资料，随后可能插入视频号详情并把底部按钮向下推。这里
+        先观察一段固定时间，再连续读取当前控件树；按钮矩形稳定后才点击中央区域。
+        点击前还会重新读取一次，确认控件没有再次移动。微信虽暴露
+        InvokePattern，但实测调用成功后事件会被吞，不能拿它替代坐标点击。
+        """
+        started_at = self._monotonic()
+        settle_at = started_at + self.add_button_settle_delay
+        deadline = started_at + self.add_button_wait_timeout
+        stable_count = 0
+        previous = None
+        fresh = None
+        while self._monotonic() < deadline:
+            candidate = self._fresh_add_button(card)
+            current = self._control_rect(candidate) if candidate is not None else None
+            observing = self._monotonic() < settle_at
+            if observing:
+                stable_count = 0
+            elif current is not None and current == previous:
+                stable_count += 1
+            elif current is not None:
+                stable_count = 1
+            else:
+                stable_count = 0
+            previous = current
+            fresh = candidate
+            if stable_count >= self.add_button_stable_samples:
+                latest = self._fresh_add_button(card)
+                latest_rect = self._control_rect(latest) if latest is not None else None
+                if latest_rect == previous:
+                    fresh = latest
+                    break
+                previous = latest_rect
+                fresh = latest
+                stable_count = 1 if latest_rect is not None else 0
+            self._wait_for_layout(self.add_button_poll_interval)
+        if fresh is None or previous is None:
+            return _result(False, "no-add-button：添加按钮在点击前消失")
+        if stable_count < self.add_button_stable_samples:
+            return _result(False, "unstable-add-button：添加按钮仍在移动，未点击")
+
+        left, top, right, bottom = previous
+        x = (left + right) // 2
+        y = (top + bottom) // 2
+        result = self._click(card_hwnd, fresh, at=(x, y), raise_it=False)
+        if result["ok"]:
+            result["activation"] = "stable-coordinate"
+        return result
+
+    def detect_risk_control(self, extra: Sequence[object] = ()) -> Optional[str]:
+        """检查申请相关弹窗中的风控提示，不扫描微信主窗口聊天内容。"""
+        controls = list(extra)
+        for _hwnd, ctrl in self._top_windows():
+            try:
+                if (ctrl.ClassName or "") == "mmui::MainWindow":
+                    continue
+            except Exception:
+                continue
+            if all(ctrl is not item for item in controls):
+                controls.append(ctrl)
+        names: List[str] = []
+        for ctrl in controls:
+            try:
+                names.extend(self._names(ctrl, 160))
+            except Exception:
+                continue
+        return find_risk_control_text(names)
+
+    def _request_edit(self, dlg, name: str):
+        """按名称精确定位好友申请窗口中的编辑框。"""
+        return self._find(dlg, (name,), cls="Edit", contains=False)
+
+    @staticmethod
+    def _value(ctrl) -> str:
+        """读取编辑框 ValuePattern，控件未进入编辑态时返回空串。"""
+        try:
+            pattern = ctrl.GetValuePattern()
+            return (pattern.Value or "") if pattern is not None else ""
+        except Exception:
+            return ""
+
+    def _set_request_text(self, hwnd: int, ctrl, text: str,
+                          field: str) -> Dict:
+        """聚焦并覆盖好友申请窗口中的一个文本字段。"""
+        clicked = self._click(hwnd, ctrl, raise_it=False)
+        if not clicked["ok"]:
+            return clicked
+        if not self._type_text(ctrl, text):
+            return _result(False, "type-failed：%s没有写入" % field)
+        rhythm.nap(0.25)
+        return _result(True, "ok")
+
+    def _select_request_label(self, hwnd: int, dlg, label: str) -> Dict:
+        """打开标签弹层并选择精确或唯一包含匹配的标签。"""
+        button = self._find(dlg, (LABEL_EDIT_NAME,), cls="mmui::XHBoxView",
+                            contains=False)
+        if button is None:
+            return _result(False, "no-label-button：找不到好友申请里的标签入口")
+        before = {h for h, _ctrl in self._top_windows()}
+        clicked = self._click(hwnd, button, raise_it=False)
+        if not clicked["ok"]:
+            return clicked
+        pop = self._wait_top(LABEL_POPOVER_CLS, timeout=3.0, exclude=before)
+        if pop is None:
+            # 弹层可能复用了旧 hwnd，去掉 exclude 再找一次。
+            pop = self._wait_top(LABEL_POPOVER_CLS, timeout=1.0)
+        if pop is None:
+            return _result(False, "no-label-popover：点了标签但选择层没有出现")
+        pop_hwnd, panel = pop
+        rows = self._rows(panel, LABEL_CELL_CLS)
+        exact = [row for row in rows if (row.Name or "").strip() == label]
+        matches = exact or [row for row in rows
+                            if label in (row.Name or "").strip()]
+        if len(matches) != 1:
+            try:
+                panel.SendKeys("{Esc}")
+            except Exception:
+                pass
+            names = [(row.Name or "").strip() for row in rows]
+            if not matches:
+                return _result(False, "label-not-found：找不到标签 %r" % label,
+                               labels=names)
+            return _result(False, "label-ambiguous：标签 %r 命中多个结果" % label,
+                           labels=[(row.Name or "").strip() for row in matches])
+        selected_name = (matches[0].Name or "").strip()
+        result = self._click(pop_hwnd, matches[0], raise_it=False)
+        if not result["ok"]:
+            return result
+        rhythm.nap(0.35)
+        # 多选弹层通常不会自动关闭；选择完成后按 Esc 回到申请窗口。
+        if any(h == pop_hwnd for h, _ctrl in self._top_windows()):
+            try:
+                panel.SendKeys("{Esc}")
+            except Exception:
+                pass
+            rhythm.nap(0.2)
+        return _result(True, "ok", label=selected_name)
+
+    def configure_request(self, hwnd: int, dlg, message: Optional[str] = None,
+                          remark_suffix: Optional[str] = None,
+                          label: Optional[str] = None) -> Dict:
+        """填写申请语、追加备注并选择标签，不点击最终提交按钮。"""
+        if message is not None:
+            edit = self._request_edit(dlg, REQUEST_HINT)
+            if edit is None:
+                return _result(False, "no-message-edit：找不到“发送添加朋友申请”输入框")
+            result = self._set_request_text(hwnd, edit, message, "好友申请语")
+            if not result["ok"]:
+                return result
+        if remark_suffix:
+            edit = self._request_edit(dlg, REMARK_EDIT_NAME)
+            if edit is None:
+                return _result(False, "no-remark-edit：找不到“备注”输入框")
+            clicked = self._click(hwnd, edit, raise_it=False)
+            if not clicked["ok"]:
+                return clicked
+            rhythm.nap(0.15)
+            current = self._value(edit)
+            if not current:
+                try:
+                    current = (edit.GetParentControl().Name or "").strip()
+                except Exception:
+                    current = ""
+            remark = append_remark(current, remark_suffix)
+            if not self._type_text(edit, remark):
+                return _result(False, "type-failed：备注没有写入")
+            rhythm.nap(0.25)
+        selected_label = None
+        if label:
+            result = self._select_request_label(hwnd, dlg, label)
+            if not result["ok"]:
+                return result
+            selected_label = result.get("label")
+        return _result(True, "ok", remark_suffix=remark_suffix,
+                       label=selected_label)
+
+    def send_request(self, message: Optional[str] = None,
+                     card_window: Optional[Tuple[int, object]] = None,
+                     remark_suffix: Optional[str] = None,
+                     label: Optional[str] = None) -> Dict:
+        """找申请框 → （可选）填留言 → 点提交（「确定」，老版本「发送」）。
+
+        ``card_window`` 给手机号搜索产生的 ``AddFriendWindow`` 使用；群成员
+        路径省略它，仍自动查找 ``ProfileUniquePop``。
+        """
+        card_hwnd, card = card_window or self._top_by_class(PROFILE_POP_CLS) or (0, None)
         before = [h for h, _ in self._top_windows()]
         # 点「添加到通讯录」
         state = self.card_state(card) if card is not None else {"ok": False}
         if not state.get("add"):
             return _result(False, state.get("reason", "no-card：资料卡不在了"))
         add = state["add_btn"]
-        r = self._click(card_hwnd, add, raise_it=False)
+        r = self._activate_add_button(card_hwnd, card, add)
         if not r["ok"]:
             return r
-        rhythm.nap(0.6)
 
         hwnd, dlg, seen = self.find_request_dialog(before, card_hwnd, card)
         if dlg is None:
+            risk = self.detect_risk_control()
+            if risk:
+                return _result(False, "risk-control：%s" % risk,
+                               risk_control=True, windows=seen)
             return _result(False,
                            "no-dialog：点了「添加到通讯录」但没找到好友申请框"
                            "（新窗：%s）" % (", ".join(seen) or "无"),
                            windows=seen)
-        if message:
-            edit = self._find(dlg, (), cls="Edit", contains=False)
-            if edit is None:
-                return _result(False, "no-edit：申请框里找不到留言输入框，未发送",
-                               windows=seen)
-            rr = self._click(hwnd, edit, raise_it=False)
-            if not rr["ok"]:
-                return rr
-            if not self._type_text(edit, message):
-                return _result(False, "type-failed：留言没贴进去")
-            rhythm.nap(0.3)
+        configured = self.configure_request(
+            hwnd, dlg, message=message, remark_suffix=remark_suffix, label=label)
+        if not configured["ok"]:
+            configured["windows"] = seen
+            return configured
         send = self._find(dlg, SEND_BTN_NAMES, cls="Button", contains=False)
         if send is None:
             return _result(False, "no-send：申请框里找不到提交按钮（确定/发送）",
@@ -387,11 +639,40 @@ class GroupAddFriendOps(LabelOps):
         if not sr["ok"]:
             return sr
         deadline = time.time() + 4.0
+        closed = False
         while time.time() < deadline:
+            risk = self.detect_risk_control((dlg,))
+            if risk:
+                return _result(False, "risk-control：%s" % risk,
+                               risk_control=True, windows=seen,
+                               remark_suffix=remark_suffix,
+                               label=configured.get("label"))
             if not any(h == hwnd for h, _c in self._top_windows()):
+                closed = True
                 break
             rhythm.nap(0.2)
-        return _result(True, "ok", sent=True, windows=seen)
+        if not closed:
+            risk = self.detect_risk_control((dlg,))
+            if risk:
+                return _result(False, "risk-control：%s" % risk,
+                               risk_control=True, windows=seen)
+            return _result(False, "send-unconfirmed：提交后申请窗口没有关闭",
+                           sent=False, windows=seen,
+                           remark_suffix=remark_suffix,
+                           label=configured.get("label"))
+        # 有些频控提示比申请窗关闭稍晚出现，留一个短观察窗口再判成功。
+        grace_deadline = time.time() + 1.2
+        while time.time() < grace_deadline:
+            risk = self.detect_risk_control()
+            if risk:
+                return _result(False, "risk-control：%s" % risk,
+                               risk_control=True, windows=seen,
+                               remark_suffix=remark_suffix,
+                               label=configured.get("label"))
+            rhythm.nap(0.2)
+        return _result(True, "ok", sent=True, windows=seen,
+                       remark_suffix=remark_suffix,
+                       label=configured.get("label"))
 
     # ------------------------------------------------------------------ 对外
     def probe(self, group: str, member: str) -> Dict:
@@ -462,4 +743,8 @@ class GroupAddFriendOps(LabelOps):
         return sent
 
 
-__all__ = ["GroupAddFriendOps"]
+__all__ = [
+    "GroupAddFriendOps",
+    "append_remark",
+    "find_risk_control_text",
+]
