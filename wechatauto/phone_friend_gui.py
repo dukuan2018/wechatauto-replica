@@ -32,7 +32,7 @@ from wechatauto.wechat_auth import (
 
 
 # 桌面端发布版本；每次发布新版本时只递增小版本号。
-DESKTOP_VERSION = "v1.7"
+DESKTOP_VERSION = "v1.8"
 DISCLAIMER_TEXT = (
     "本软件为辅助工具。好友查找和申请操作通过识别并操作电脑上的微信客户端界面完成，"
     "不调用微信好友添加接口。\n\n"
